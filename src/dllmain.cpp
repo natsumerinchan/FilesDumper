@@ -8,7 +8,63 @@
 #include <thread>
 #include <set>
 #include <cctype>
-#include <algorithm> // 新增头文件
+#include <algorithm>
+#include <future>
+#include <deque>
+#include <condition_variable>
+
+// 线程池类
+class ThreadPool {
+public:
+    ThreadPool(size_t threads) : stop(false) {
+        for (size_t i = 0; i < threads; ++i) {
+            workers.emplace_back([this] {
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(queue_mutex);
+                        condition.wait(lock, [this] { return stop || !tasks.empty(); });
+                        if (stop && tasks.empty()) return;
+                        task = std::move(tasks.front());
+                        tasks.pop_front();
+                    }
+                    task();
+                }
+            });
+        }
+    }
+
+    template<class F>
+    void enqueue(F&& f) {
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            if (stop)
+                throw std::runtime_error("enqueue on stopped ThreadPool");
+            tasks.emplace_back(std::forward<F>(f));
+        }
+        condition.notify_one();
+    }
+
+    ~ThreadPool() {
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            stop = true;
+        }
+        condition.notify_all();
+        for (std::thread &worker : workers)
+            worker.join();
+    }
+
+private:
+    std::vector<std::thread> workers;
+    std::deque<std::function<void()>> tasks;
+    std::mutex queue_mutex;
+    std::condition_variable condition;
+    bool stop;
+};
+
+// 全局线程池
+ThreadPool* globalThreadPool = nullptr;
 
 // 导出函数声明
 extern "C" __declspec(dllexport) void StartHook();
@@ -114,7 +170,7 @@ static HANDLE (WINAPI * TrueCreateFileA)(
     DWORD dwFlagsAndAttributes,
     HANDLE hTemplateFile) = CreateFileA;
 
-// 简单安全地转储文件
+// 安全转储文件（支持大文件分块处理）
 void SafeDumpFile(wchar_t const* wpath) {
     // 检查是否已经转储过
     {
@@ -127,50 +183,116 @@ void SafeDumpFile(wchar_t const* wpath) {
 
     HANDLE hReadFile = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ,
                                   NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hReadFile == INVALID_HANDLE_VALUE) return;
+    if (hReadFile == INVALID_HANDLE_VALUE) {
+        if (logFile.is_open()) {
+            wchar_t logBuffer[512];
+            swprintf_s(logBuffer, L"打开文件失败: %s (错误代码: %lu)\r\n", wpath, GetLastError());
+            logFile << WideToUTF8(logBuffer);
+            logFile.flush();
+        }
+        return;
+    }
 
-    DWORD fileSize = GetFileSize(hReadFile, NULL);
-    if (fileSize == INVALID_FILE_SIZE || fileSize == 0) {
+    LARGE_INTEGER fileSize;
+    if (!GetFileSizeEx(hReadFile, &fileSize) || fileSize.QuadPart == 0) {
         CloseHandle(hReadFile);
         return;
     }
 
-    BYTE* buffer = new BYTE[fileSize];
-    DWORD read;
-    if (ReadFile(hReadFile, buffer, fileSize, &read, NULL) && read == fileSize) {
-        wchar_t dumpDir[MAX_PATH];
-        GetCurrentDirectoryW(MAX_PATH, dumpDir);
-        PathCombineW(dumpDir, dumpDir, L"dumpfiles");
-        CreateDirectoryW(dumpDir, NULL);
+    // 创建转储目录
+    wchar_t dumpDir[MAX_PATH];
+    GetCurrentDirectoryW(MAX_PATH, dumpDir);
+    PathCombineW(dumpDir, dumpDir, L"dumpfiles");
+    CreateDirectoryW(dumpDir, NULL);
 
-        const wchar_t* lastBackslash = wcsrchr(wpath, L'\\');
-        if (!lastBackslash) lastBackslash = wcsrchr(wpath, L'/');
-        const wchar_t* pureFilename = lastBackslash ? lastBackslash + 1 : wpath;
+    // 提取纯净文件名
+    const wchar_t* lastBackslash = wcsrchr(wpath, L'\\');
+    if (!lastBackslash) lastBackslash = wcsrchr(wpath, L'/');
+    const wchar_t* pureFilename = lastBackslash ? lastBackslash + 1 : wpath;
 
-        wchar_t dumpPath[MAX_PATH];
-        PathCombineW(dumpPath, dumpDir, pureFilename);
+    wchar_t dumpPath[MAX_PATH];
+    PathCombineW(dumpPath, dumpDir, pureFilename);
 
-        HANDLE hDumpFile = CreateFileW(dumpPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hDumpFile != INVALID_HANDLE_VALUE) {
-            DWORD written;
-            WriteFile(hDumpFile, buffer, fileSize, &written, NULL);
-            CloseHandle(hDumpFile);
+    HANDLE hDumpFile = CreateFileW(dumpPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hDumpFile == INVALID_HANDLE_VALUE) {
+        CloseHandle(hReadFile);
+        if (logFile.is_open()) {
+            wchar_t logBuffer[512];
+            swprintf_s(logBuffer, L"创建转储文件失败: %s (错误代码: %lu)\r\n", dumpPath, GetLastError());
+            logFile << WideToUTF8(logBuffer);
+            logFile.flush();
+        }
+        return;
+    }
 
-            if (logFile.is_open()) {
-                wchar_t buffer[512];
-                swprintf_s(buffer, L"文件转储成功: %s (大小: %lu 字节)\r\n", wpath, written);
-                logFile << WideToUTF8(buffer);
-                logFile.flush();
+    try {
+        const DWORD bufferSize = 10 * 1024 * 1024; // 10MB 缓冲区
+        std::vector<BYTE> buffer(bufferSize);
+        DWORD64 totalBytesWritten = 0;
+        DWORD bytesRead = 0;
+        DWORD bytesWritten = 0;
+
+        while (totalBytesWritten < static_cast<DWORD64>(fileSize.QuadPart)) {
+            if (!ReadFile(hReadFile, buffer.data(), bufferSize, &bytesRead, NULL)) {
+                // 读取错误处理
+                DWORD error = GetLastError();
+                if (logFile.is_open()) {
+                    wchar_t logBuffer[512];
+                    swprintf_s(logBuffer, L"文件读取错误: %s (位置: %llu, 错误代码: %lu)\r\n", 
+                              wpath, totalBytesWritten, error);
+                    logFile << WideToUTF8(logBuffer);
+                    logFile.flush();
+                }
+                break;
             }
 
-            // 将文件添加到已转储集合
-            std::lock_guard<std::mutex> lock(dumpedFilesMutex);
-            dumpedFiles.insert(wpath);
+            if (bytesRead == 0) break; // 文件结束
+
+            DWORD bytesToWrite = bytesRead;
+            BYTE* currentPos = buffer.data();
+
+            while (bytesToWrite > 0) {
+                if (!WriteFile(hDumpFile, currentPos, bytesToWrite, &bytesWritten, NULL)) {
+                    // 写入错误处理
+                    if (logFile.is_open()) {
+                        wchar_t logBuffer[512];
+                        swprintf_s(logBuffer, L"转储写入错误: %s (位置: %llu, 错误代码: %lu)\r\n", 
+                                  dumpPath, totalBytesWritten + (bytesRead - bytesToWrite), GetLastError());
+                        logFile << WideToUTF8(logBuffer);
+                        logFile.flush();
+                    }
+                    break;
+                }
+
+                bytesToWrite -= bytesWritten;
+                currentPos += bytesWritten;
+                totalBytesWritten += bytesWritten;
+            }
+        }
+
+        // 成功转储日志
+        if (logFile.is_open()) {
+            wchar_t logBuffer[512];
+            swprintf_s(logBuffer, L"文件转储完成: %s (大小: %llu 字节)\r\n", wpath, totalBytesWritten);
+            logFile << WideToUTF8(logBuffer);
+            logFile.flush();
+        }
+
+        // 添加到已转储集合
+        std::lock_guard<std::mutex> lock(dumpedFilesMutex);
+        dumpedFiles.insert(wpath);
+    }
+    catch (...) {
+        if (logFile.is_open()) {
+            wchar_t logBuffer[512];
+            swprintf_s(logBuffer, L"转储过程中发生异常: %s\r\n", wpath);
+            logFile << WideToUTF8(logBuffer);
+            logFile.flush();
         }
     }
 
-    delete[] buffer;
     CloseHandle(hReadFile);
+    CloseHandle(hDumpFile);
 }
 
 // 钩子函数
@@ -264,11 +386,16 @@ HANDLE WINAPI HookedCreateFileA(
     }
 
     // 在后台线程进行文件转储
-    std::thread dumpThread([wpath]() {
+    if (globalThreadPool) {
+        globalThreadPool->enqueue([wpath] {
+            SafeDumpFile(wpath);
+            delete[] wpath;
+        });
+    } else {
+        // 失败时同步转储（应避免）
         SafeDumpFile(wpath);
         delete[] wpath;
-    });
-    dumpThread.detach();
+    }
 
     return hFile;
 }
@@ -293,10 +420,17 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
         }
     }
     else if (reason == DLL_PROCESS_DETACH) {
+        // 首先卸载钩子，防止新任务加入线程池
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
         DetourDetach(&(PVOID&)TrueCreateFileA, HookedCreateFileA);
         DetourTransactionCommit();
+
+        // 删除线程池，让线程池优雅关闭
+        if (globalThreadPool) {
+            delete globalThreadPool;
+            globalThreadPool = nullptr;
+        }
     }
     
     return TRUE;
