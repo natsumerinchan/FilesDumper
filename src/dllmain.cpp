@@ -191,6 +191,16 @@ HANDLE WINAPI HookedCreateFileA(
     // === 新增：配置过滤逻辑开始 ===
     // 如果配置模式为禁用（-1），则不进行转储
     if (g_mode == -1) {
+        // 记录日志：禁用模式跳过
+        {
+            std::lock_guard<std::mutex> lock(logMutex);
+            if (logFile.is_open()) {
+                wchar_t logBuffer[512];
+                swprintf_s(logBuffer, L"文件跳过（禁用模式）: %s\r\n", wpath);
+                logFile << WideToUTF8(logBuffer);
+                logFile.flush();
+            }
+        }
         delete[] wpath;
         return TrueCreateFileA(lpFileName, dwDesiredAccess, dwShareMode,
                               lpSecurityAttributes, dwCreationDisposition,
@@ -208,19 +218,39 @@ HANDLE WINAPI HookedCreateFileA(
         
         // 黑白名单检查
         if (g_mode == 0) { // 黑名单模式：在名单中的跳过
-            if (inList) {
-                delete[] wpath;
-                return TrueCreateFileA(lpFileName, dwDesiredAccess, dwShareMode,
-                                      lpSecurityAttributes, dwCreationDisposition,
-                                      dwFlagsAndAttributes, hTemplateFile);
+    if (inList) {
+        // 记录日志：黑名单模式跳过
+        {
+            std::lock_guard<std::mutex> lock(logMutex);
+            if (logFile.is_open()) {
+                wchar_t logBuffer[512];
+                swprintf_s(logBuffer, L"文件跳过（黑名单模式）: %s\r\n", wpath);
+                logFile << WideToUTF8(logBuffer);
+                logFile.flush();
             }
+        }
+        delete[] wpath;
+        return TrueCreateFileA(lpFileName, dwDesiredAccess, dwShareMode,
+                              lpSecurityAttributes, dwCreationDisposition,
+                              dwFlagsAndAttributes, hTemplateFile);
+    }
         } else if (g_mode == 1) { // 白名单模式：不在名单中的跳过
-            if (!inList) {
-                delete[] wpath;
-                return TrueCreateFileA(lpFileName, dwDesiredAccess, dwShareMode,
-                                      lpSecurityAttributes, dwCreationDisposition,
-                                      dwFlagsAndAttributes, hTemplateFile);
+        if (!inList) {
+            // 记录日志：白名单模式跳过
+            {
+                std::lock_guard<std::mutex> lock(logMutex);
+                if (logFile.is_open()) {
+                    wchar_t logBuffer[512];
+                    swprintf_s(logBuffer, L"文件跳过（白名单模式）: %s\r\n", wpath);
+                    logFile << WideToUTF8(logBuffer);
+                    logFile.flush();
+                }
             }
+            delete[] wpath;
+            return TrueCreateFileA(lpFileName, dwDesiredAccess, dwShareMode,
+                                  lpSecurityAttributes, dwCreationDisposition,
+                                  dwFlagsAndAttributes, hTemplateFile);
+        }
         }
     }
     // === 新增：配置过滤逻辑结束 ===
